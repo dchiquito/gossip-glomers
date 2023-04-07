@@ -61,7 +61,7 @@ impl Server {
         let init_ok = InitOk::new(&init);
         server.node_id = init.node_id;
         server.node_ids = init.node_ids;
-        server.respond(message, init_ok);
+        server.respond(message, init_ok).unwrap();
         server
     }
     fn read_message(&self) -> serde_json::Result<Message> {
@@ -94,6 +94,6 @@ fn main() -> serde_json::Result<()> {
         let mut echo: Echo = message.parse_body()?;
         echo.r#type = "echo_ok".to_string();
         echo.in_reply_to = Some(echo.msg_id);
-        server.respond(message, echo);
+        server.respond(message, echo)?;
     }
 }
