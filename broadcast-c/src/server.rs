@@ -1,10 +1,14 @@
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{from_value, to_value, Map, Result, Value};
 use std::hash::{Hash, Hasher};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message<T> {
     pub src: String,
     pub dest: String,
@@ -48,25 +52,30 @@ impl InitOk {
 type Handler = dyn FnMut(&mut Sender, &Message<Map<String, Value>>) -> Result<()>;
 
 pub struct Server {
-    pub sender: Sender,
+    pub sender: Arc<Mutex<Sender>>,
     handlers: HashMap<String, Box<Handler>>,
 }
 
 impl Server {
     pub fn new() -> Server {
-        let mut server = Server {
-            sender: Sender {
+        let server = Server {
+            sender: Arc::new(Mutex::new(Sender {
                 node_id: "".to_string(),
                 node_ids: vec![],
                 counter: 0,
-                pending_rpcs: HashMap::new(),
-            },
+                // pending_rpcs: HashMap::new(),
+            })),
             handlers: HashMap::new(),
         };
         let init: Message<Init> = server.read_message().unwrap();
-        server.sender.init(&init);
+        server.sender.lock().unwrap().init(&init);
         let init_ok = InitOk::new(&init.body);
-        server.sender.respond(&init, &init_ok).unwrap();
+        server
+            .sender
+            .lock()
+            .unwrap()
+            .respond(&init, &init_ok)
+            .unwrap();
         server
     }
     pub fn read_message<T: DeserializeOwned>(&self) -> Result<Message<T>> {
@@ -85,18 +94,18 @@ impl Server {
             let message: Message<Map<String, Value>> = self.read_message()?;
             eprintln!("Handling {:?}", message);
             // Check if we are waiting for a response for that msg_id
-            if let Some(Value::Number(in_reply_to)) = message.body.get("in_reply_to") {
-                eprintln!("gotta replyto {:?}", in_reply_to);
-                if let Some(mut handler) = self
-                    .sender
-                    .pending_rpcs
-                    .remove(&in_reply_to.as_u64().unwrap())
-                {
-                    eprintln!("gotta rhandle ");
-                    handler(&mut self.sender, &message)?;
-                    continue;
-                }
-            }
+            // if let Some(Value::Number(in_reply_to)) = message.body.get("in_reply_to") {
+            //     eprintln!("gotta replyto {:?}", in_reply_to);
+            //     if let Some((_, _, mut handler)) = self
+            //         .sender
+            //         .pending_rpcs
+            //         .remove(&in_reply_to.as_u64().unwrap())
+            //     {
+            //         eprintln!("gotta rhandle ");
+            //         handler(&mut self.sender, &message)?;
+            //         continue;
+            //     }
+            // }
             // Check if there is a valid handler
             if let Some(handler) = self.handlers.get_mut(
                 message
@@ -106,7 +115,7 @@ impl Server {
                     .as_str()
                     .expect("Message type was not a string"),
             ) {
-                handler(&mut self.sender, &message)?;
+                handler(&mut self.sender.lock().unwrap(), &message)?;
                 continue;
             }
             panic!("No handler for {:?}", message);
@@ -114,11 +123,13 @@ impl Server {
     }
 }
 
+// type PendingMessage = (Instant, Message<Map<String, Value>>, Box<Handler>);
+
 pub struct Sender {
     pub node_id: String,
     pub node_ids: Vec<String>,
     counter: u64,
-    pending_rpcs: HashMap<u64, Box<Handler>>,
+    // pending_rpcs: HashMap<u64, PendingMessage>,
 }
 
 impl Sender {
@@ -129,20 +140,37 @@ impl Sender {
         self.node_id.hash(&mut hasher);
         self.counter = hasher.finish();
     }
+    /// Adds the msg_id field to a body and wraps it in a Message
+    pub fn message<T: Serialize>(
+        &mut self,
+        to: &str,
+        body: T,
+    ) -> Result<Message<Map<String, Value>>> {
+        let mut body_map = match to_value(body)? {
+            Value::Object(map) => map,
+            _ => panic!("Message body is not an object"),
+        };
+        let msg_id = self.counter;
+        self.counter += 1;
+        body_map.insert("msg_id".to_string(), to_value(msg_id)?);
+        Ok(Message {
+            src: self.node_id.clone(),
+            dest: to.to_string(),
+            body: body_map,
+        })
+    }
+    /// Write a message to stdout. msg_id will not be included
     pub fn send_message<T: Serialize>(&self, message: &Message<T>) -> Result<()> {
         println!("{}", serde_json::to_string(message)?);
         Ok(())
     }
-    pub fn send_body<T: Serialize>(&self, to: &str, body: &T) -> Result<()> {
-        let message = Message {
-            src: self.node_id.clone(),
-            dest: to.to_string(),
-            body,
-        };
+    /// Send a message body to stdout
+    pub fn send_body<T: Serialize>(&mut self, to: &str, body: T) -> Result<()> {
+        let message = self.message(to, body)?;
         self.send_message(&message)
     }
     /// Respond to a message. If the message has a msg_id, set the in_reply_to appropriately
-    pub fn respond<T: Serialize, U: Serialize>(&self, to: &Message<T>, body: &U) -> Result<()> {
+    pub fn respond<T: Serialize, U: Serialize>(&mut self, to: &Message<T>, body: &U) -> Result<()> {
         let original_body_map = match to_value(&to.body)? {
             Value::Object(map) => map,
             _ => panic!("Message body is not an object"),
@@ -159,21 +187,19 @@ impl Sender {
             self.send_body(&to.src, body)
         }
     }
-    pub fn rpc<T: Serialize, F>(&mut self, to: &str, body: &T, callback: F) -> Result<()>
-    where
-        F: FnMut(&mut Sender, &Message<Map<String, Value>>) -> Result<()> + 'static,
-    {
-        eprintln!("RPC TIME BABY {} {}", to, serde_json::to_string(body)?);
-        let mut body_map = match to_value(body)? {
-            Value::Object(map) => map,
-            _ => panic!("Message body is not an object"),
-        };
-        let msg_id = self.counter;
-        self.counter += 1;
-        body_map.insert("msg_id".to_string(), to_value(msg_id)?);
-        eprintln!("BRACED {:?}", body_map);
-        self.pending_rpcs.insert(msg_id, Box::new(callback));
-        eprintln!("keys {:?}", self.pending_rpcs.keys());
-        self.send_body(to, &body_map)
-    }
+    // TODO rpc callbacks are not thread safe
+    // pub fn rpc<T: Serialize, F>(&mut self, to: &str, body: &T, callback: F) -> Result<()>
+    // where
+    //     F: FnMut(&mut Sender, &Message<Map<String, Value>>) -> Result<()> + 'static,
+    // {
+    //     let message = self.message(to, body)?;
+    //     self.pending_rpcs.insert(
+    //         message.body.get("msg_id").unwrap().as_u64().unwrap(),
+    //         (Instant::now(), message.clone(), Box::new(callback)),
+    //     );
+    //     self.send_message(&message)
+    // }
+
+    // TODO retry unacked messages?
+    // pub fn check_for_timeouts() {}
 }
