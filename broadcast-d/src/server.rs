@@ -46,7 +46,6 @@ impl Server {
     }
 }
 
-#[derive(Clone)]
 pub struct Sender {
     pub node_id: String,
     pub node_ids: Vec<String>,
