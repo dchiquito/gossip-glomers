@@ -1,7 +1,5 @@
 use std::cell::RefCell;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
-use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
@@ -12,8 +10,17 @@ mod server;
 #[derive(Serialize, Deserialize, Debug)]
 struct Broadcast {
     r#type: String,
-    msg_id: u64,
+    msg_id: Option<u64>,
     message: u64,
+}
+impl Broadcast {
+    fn new(message: u64) -> Broadcast {
+        Broadcast {
+            r#type: "broadcast".to_string(),
+            msg_id: None,
+            message,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -56,6 +63,7 @@ impl TopologyOk {
 
 fn main() -> serde_json::Result<()> {
     let mut server = Server::new();
+    let adj_nodes = server.sender.node_ids.clone();
     let messages = Rc::new(RefCell::new(vec![]));
     let messages_read = messages.clone();
     let mut messages_set = HashSet::new();
@@ -64,6 +72,9 @@ fn main() -> serde_json::Result<()> {
         let message = msg.body.message;
         if messages_set.insert(message) {
             messages.borrow_mut().push(message);
+            for adj_node in adj_nodes.iter() {
+                sender.rpc(adj_node, &Broadcast::new(message), |_, _| Ok(()))?;
+            }
         }
         sender.respond(&msg, &BroadcastOk::new())
     });

@@ -83,13 +83,16 @@ impl Server {
     pub fn serve(&mut self) -> serde_json::Result<()> {
         loop {
             let message: Message<Map<String, Value>> = self.read_message()?;
+            eprintln!("Handling {:?}", message);
             // Check if we are waiting for a response for that msg_id
             if let Some(Value::Number(in_reply_to)) = message.body.get("in_reply_to") {
+                eprintln!("gotta replyto {:?}", in_reply_to);
                 if let Some(mut handler) = self
                     .sender
                     .pending_rpcs
                     .remove(&in_reply_to.as_u64().unwrap())
                 {
+                    eprintln!("gotta rhandle ");
                     handler(&mut self.sender, &message)?;
                     continue;
                 }
@@ -150,6 +153,7 @@ impl Sender {
                 _ => panic!("Message body is not an object"),
             };
             new_body_map.insert("in_reply_to".to_string(), msg_id.clone());
+            eprintln!("RESPONSIN {:?}", new_body_map);
             self.send_body(&to.src, &new_body_map)
         } else {
             self.send_body(&to.src, body)
@@ -159,6 +163,7 @@ impl Sender {
     where
         F: FnMut(&mut Sender, &Message<Map<String, Value>>) -> Result<()> + 'static,
     {
+        eprintln!("RPC TIME BABY {} {}", to, serde_json::to_string(body)?);
         let mut body_map = match to_value(body)? {
             Value::Object(map) => map,
             _ => panic!("Message body is not an object"),
@@ -166,7 +171,9 @@ impl Sender {
         let msg_id = self.counter;
         self.counter += 1;
         body_map.insert("msg_id".to_string(), to_value(msg_id)?);
+        eprintln!("BRACED {:?}", body_map);
         self.pending_rpcs.insert(msg_id, Box::new(callback));
-        self.send_body(to, body)
+        eprintln!("keys {:?}", self.pending_rpcs.keys());
+        self.send_body(to, &body_map)
     }
 }
