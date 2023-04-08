@@ -11,51 +11,146 @@ mod server;
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum P {
-    Add { delta: u64 },
+    Add {
+        delta: u64,
+    },
     AddOk {},
-    Read {},
-    ReadOk { value: u64 },
-    Error { code: u64, text: String },
+    Read {
+        key: Option<String>,
+    },
+    ReadOk {
+        value: u64,
+    },
+    Write {
+        key: String,
+        value: u64,
+    },
+    WriteOk {},
+    Cas {
+        key: String,
+        from: u64,
+        to: u64,
+        create_if_not_exists: bool,
+    },
+    CasOk {},
+    Error {
+        code: u64,
+        text: String,
+    },
 }
 
 struct Context {
     sender: Sender,
-    value: u64,
+    delta: u64,
+    last_global: u64,
+    pendings: HashMap<u64, (u64, u64)>,
 }
 
 fn main() -> serde_json::Result<()> {
-    let (server, sender) = server::init()?;
-    let neighbors = sender.node_ids.clone();
-    let context: Arc<Mutex<Context>> = Arc::new(Mutex::new(Context { sender, value: 0 }));
+    let (server, mut sender) = server::init()?;
+    sender.send(
+        "seq-kv",
+        &P::Write {
+            key: "global".to_string(),
+            value: 0,
+        },
+    )?;
+    let context: Arc<Mutex<Context>> = Arc::new(Mutex::new(Context {
+        sender,
+        delta: 0,
+        last_global: 0,
+        pendings: HashMap::new(),
+    }));
     let thread_context = context.clone();
     std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_secs(1));
         let mut ctx = thread_context.lock().unwrap();
         let ctx = ctx.deref_mut();
-        for neighbor in neighbors.iter() {
-            ctx.sender
-                .send(neighbor, &P::ReadOk { value: 666 })
-                .expect("Error sending refresh");
-        }
+        // Reread the global value periodically for eventual consistency
+        ctx.sender
+            .send(
+                "seq-kv",
+                &P::Read {
+                    key: Some("global".to_string()),
+                },
+            )
+            .expect("Error sending reread");
     });
     loop {
         let message: Message<P> = server.read_message()?;
         let mut ctx = context.lock().unwrap();
         let mut ctx = ctx.deref_mut();
         match message.body.fields {
+            // Increment our local delta appropriately
             P::Add { delta } => {
-                ctx.value += delta;
-                ctx.sender.send("seq-kv", &P::Read {})?;
+                ctx.delta += delta;
+                ctx.sender
+                    .send(
+                        "seq-kv",
+                        &P::Read {
+                            key: Some("global".to_string()),
+                        },
+                    )
+                    .expect("Error sending reread");
                 ctx.sender.respond(&message, &P::AddOk {})?
             }
-            P::AddOk {} => {}
-            P::Read {} => ctx
-                .sender
-                .respond(&message, &P::ReadOk { value: ctx.value })?,
+            // Maelstrom wants to know what we think the global is, use the last_global
+            P::Read { key: None } => ctx.sender.respond(
+                &message,
+                &P::ReadOk {
+                    value: ctx.last_global,
+                },
+            )?,
+            // A read from the seq-kv has returned!
+            // Update our last_global, and send off a nice fresh CAS
             P::ReadOk { value } => {
-                panic!("ahhh {}", value)
+                ctx.last_global = value;
+                if ctx.delta > 0 {
+                    let expected_value = ctx.last_global + ctx.delta;
+                    let request = &P::Cas {
+                        key: "global".to_string(),
+                        from: ctx.last_global,
+                        to: expected_value,
+                        create_if_not_exists: true,
+                    };
+                    let message = ctx.sender.message("seq-kv", request)?;
+                    ctx.pendings.insert(
+                        message.body.msg_id.expect("No msg_id???"),
+                        (ctx.delta, expected_value),
+                    );
+                    ctx.sender.send_message(&message)?;
+                }
             }
-            P::Error { code, text } => panic!("DISASTER {} {}", code, text),
+            P::WriteOk {} => {}
+            // A CAS has succeeded!
+            // Look up which request succeeded and adjust delta and last_global accordingly.
+            P::CasOk {} => {
+                let (old_delta, old_expected_value) = *ctx
+                    .pendings
+                    .get(&message.body.in_reply_to.unwrap())
+                    .unwrap();
+                ctx.pendings.clear();
+                ctx.delta -= old_delta;
+                ctx.last_global = old_expected_value;
+            }
+            P::Error { code, text } => {
+                if code == 20 {
+                    eprintln!("ERROR: {} {}", code, text);
+                } else if code == 22 {
+                    eprintln!("No cause for alarm, we are simply out of sync");
+                    ctx.sender
+                        .send(
+                            "seq-kv",
+                            &P::Read {
+                                key: Some("global".to_string()),
+                            },
+                        )
+                        .expect("Error sending reread");
+                } else {
+                    panic!("DISASTER {} {}", code, text);
+                }
+            }
+            _ => panic!("NOT ALLOWED"),
         }
     }
 }
