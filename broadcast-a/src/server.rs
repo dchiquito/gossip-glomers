@@ -84,9 +84,11 @@ impl Server {
         loop {
             let message: Message<Map<String, Value>> = self.read_message()?;
             // Check if we are waiting for a response for that msg_id
-            if let Some(Value::Number(msg_id)) = message.body.get("msg_id") {
-                if let Some(mut handler) =
-                    self.sender.pending_rpcs.remove(&msg_id.as_u64().unwrap())
+            if let Some(Value::Number(in_reply_to)) = message.body.get("in_reply_to") {
+                if let Some(mut handler) = self
+                    .sender
+                    .pending_rpcs
+                    .remove(&in_reply_to.as_u64().unwrap())
                 {
                     handler(&mut self.sender, &message)?;
                     continue;
