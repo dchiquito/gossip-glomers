@@ -56,12 +56,14 @@ impl Sender {
     fn init(init_message: &Message<InitPayload>) -> Result<Sender> {
         let mut sender = match &init_message.body.fields {
             InitPayload::Init { node_id, node_ids } => {
+                // Calculate a unique starting counter index using the hash of the node ID
                 let mut hasher = DefaultHasher::new();
                 node_id.hash(&mut hasher);
+                let counter = hasher.finish();
                 Sender {
                     node_id: node_id.clone(),
                     node_ids: node_ids.clone(),
-                    counter: hasher.finish(),
+                    counter,
                 }
             }
             _ => panic!("Invalid init message"),
@@ -70,6 +72,21 @@ impl Sender {
         eprintln!("blastin {:?}", init_ok);
         sender.respond(init_message, init_ok)?;
         Ok(sender)
+    }
+    /// Determine neighbors to ensure we can reach any other node in the network in two hops
+    pub fn sane_neighbors(&self) -> Vec<String> {
+        let mut neighbors = vec![];
+        let my_index = self
+            .node_ids
+            .iter()
+            .position(|n| n == &self.node_id)
+            .expect("node_id was not in the node_ids list");
+        let mut pow_two = 1;
+        while pow_two < self.node_ids.len() / 2 {
+            neighbors.push(self.node_ids[(my_index + pow_two) % self.node_ids.len()].to_string());
+            pow_two *= 2;
+        }
+        neighbors
     }
     /// Write a message directly to stdout
     pub fn send_message<T: Serialize>(&self, message: &Message<T>) -> Result<()> {
