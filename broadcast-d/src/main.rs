@@ -25,31 +25,41 @@ enum P {
         #[serde(rename = "messages")]
         values: Vec<u64>,
     },
+    Fyi {
+        #[serde(rename = "messages")]
+        values: Vec<u64>,
+    },
     Topology {
         topology: HashMap<String, Vec<String>>,
     },
     TopologyOk {},
 }
 
+type Context = (Sender, Vec<u64>, Vec<String>);
+
 fn main() -> serde_json::Result<()> {
     let (server, sender) = server::init()?;
-    let mut values = vec![];
-    let context: Arc<Mutex<(Sender, Vec<String>)>> = Arc::new(Mutex::new((sender, vec![])));
+    let context: Arc<Mutex<Context>> = Arc::new(Mutex::new((sender, vec![], vec![])));
     let thread_context = context.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(5));
         let mut ctx = thread_context.lock().unwrap();
-        let (sender, neighbors) = ctx.deref_mut();
+        let (sender, values, neighbors) = ctx.deref_mut();
         for neighbor in neighbors {
             sender
-                .send(neighbor, &P::Read {})
+                .send(
+                    neighbor,
+                    &P::Fyi {
+                        values: values.clone(),
+                    },
+                )
                 .expect("Error sending refresh");
         }
     });
     loop {
         let message: Message<P> = server.read_message()?;
         let mut ctx = context.lock().unwrap();
-        let (sender, neighbors) = ctx.deref_mut();
+        let (sender, values, neighbors) = ctx.deref_mut();
         match message.body.fields {
             P::Broadcast { value } => {
                 if !values.contains(&value) {
@@ -76,6 +86,15 @@ fn main() -> serde_json::Result<()> {
                 },
             )?,
             P::ReadOk {
+                values: read_values,
+            } => {
+                for value in read_values {
+                    if !values.contains(&value) {
+                        values.push(value);
+                    }
+                }
+            }
+            P::Fyi {
                 values: read_values,
             } => {
                 for value in read_values {
