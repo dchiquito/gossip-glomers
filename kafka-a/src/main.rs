@@ -1,156 +1,110 @@
 use std::collections::HashMap;
-use std::ops::DerefMut;
-use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use server::{Message, Sender};
+use server::Message;
 
 mod server;
 
-#[derive(Serialize, Deserialize)]
+type Entry = usize;
+type Offset = usize;
+
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum P {
-    Add {
-        delta: u64,
-    },
-    AddOk {},
-    Read {
-        key: Option<String>,
-    },
-    ReadOk {
-        value: u64,
-    },
-    Write {
+    Send {
         key: String,
-        value: u64,
+        msg: Entry,
     },
-    WriteOk {},
-    Cas {
-        key: String,
-        from: u64,
-        to: u64,
-        create_if_not_exists: bool,
+    SendOk {
+        offset: Offset,
     },
-    CasOk {},
+    Poll {
+        offsets: HashMap<String, Offset>,
+    },
+    PollOk {
+        msgs: HashMap<String, Vec<(Offset, Entry)>>,
+    },
+    CommitOffsets {
+        offsets: HashMap<String, Offset>,
+    },
+    CommitOffsetsOk,
+    ListCommittedOffsets {
+        keys: Vec<String>,
+    },
+    ListCommittedOffsetsOk {
+        offsets: HashMap<String, Offset>,
+    },
     Error {
         code: u64,
         text: String,
     },
 }
 
-struct Context {
-    sender: Sender,
-    delta: u64,
-    last_global: u64,
-    pendings: HashMap<u64, (u64, u64)>,
+fn binary_search<T>(arr: &[(Offset, T)], offset: Offset) -> usize {
+    if arr[0].0 >= offset {
+        return 0;
+    }
+    let mut left = 0;
+    let mut right = arr.len();
+    while left + 1 < right {
+        let index = left + ((right - left) / 2);
+        if arr[index].0 < offset {
+            left = index;
+        } else {
+            right = index;
+        }
+    }
+    right
 }
 
 fn main() -> serde_json::Result<()> {
     let (server, mut sender) = server::init()?;
-    sender.send(
-        "seq-kv",
-        &P::Write {
-            key: "global".to_string(),
-            value: 0,
-        },
-    )?;
-    let context: Arc<Mutex<Context>> = Arc::new(Mutex::new(Context {
-        sender,
-        delta: 0,
-        last_global: 0,
-        pendings: HashMap::new(),
-    }));
-    let thread_context = context.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        let mut ctx = thread_context.lock().unwrap();
-        let ctx = ctx.deref_mut();
-        // Reread the global value periodically for eventual consistency
-        ctx.sender
-            .send(
-                "seq-kv",
-                &P::Read {
-                    key: Some("global".to_string()),
-                },
-            )
-            .expect("Error sending reread");
-    });
+    let mut logs = HashMap::<String, (Vec<(Offset, Entry)>, Offset)>::new();
+    let mut commits = HashMap::<String, Offset>::new();
     loop {
         let message: Message<P> = server.read_message()?;
-        let mut ctx = context.lock().unwrap();
-        let mut ctx = ctx.deref_mut();
-        match message.body.fields {
-            // Increment our local delta appropriately
-            P::Add { delta } => {
-                ctx.delta += delta;
-                ctx.sender
-                    .send(
-                        "seq-kv",
-                        &P::Read {
-                            key: Some("global".to_string()),
-                        },
-                    )
-                    .expect("Error sending reread");
-                ctx.sender.respond(&message, &P::AddOk {})?
-            }
-            // Maelstrom wants to know what we think the global is, use the last_global
-            P::Read { key: None } => ctx.sender.respond(
-                &message,
-                &P::ReadOk {
-                    value: ctx.last_global,
-                },
-            )?,
-            // A read from the seq-kv has returned!
-            // Update our last_global, and send off a nice fresh CAS
-            P::ReadOk { value } => {
-                ctx.last_global = value;
-                if ctx.delta > 0 {
-                    let expected_value = ctx.last_global + ctx.delta;
-                    let request = &P::Cas {
-                        key: "global".to_string(),
-                        from: ctx.last_global,
-                        to: expected_value,
-                        create_if_not_exists: true,
-                    };
-                    let message = ctx.sender.message("seq-kv", request)?;
-                    ctx.pendings.insert(
-                        message.body.msg_id.expect("No msg_id???"),
-                        (ctx.delta, expected_value),
-                    );
-                    ctx.sender.send_message(&message)?;
+        match &message.body.fields {
+            P::Send { key, msg } => {
+                if !logs.contains_key(key) {
+                    logs.insert(key.clone(), (vec![], 0));
                 }
+                let log = &mut logs.get_mut(key).unwrap();
+                log.0.push((log.1, *msg));
+                sender.respond(&message, &P::SendOk { offset: log.1 })?;
+                log.1 += 10; // For sparsity, just to make my life harder
             }
-            P::WriteOk {} => {}
-            // A CAS has succeeded!
-            // Look up which request succeeded and adjust delta and last_global accordingly.
-            P::CasOk {} => {
-                let (old_delta, old_expected_value) = *ctx
-                    .pendings
-                    .get(&message.body.in_reply_to.unwrap())
-                    .unwrap();
-                ctx.pendings.clear();
-                ctx.delta -= old_delta;
-                ctx.last_global = old_expected_value;
-            }
-            P::Error { code, text } => {
-                if code == 20 {
-                    eprintln!("ERROR: {} {}", code, text);
-                } else if code == 22 {
-                    eprintln!("No cause for alarm, we are simply out of sync");
-                    ctx.sender
-                        .send(
-                            "seq-kv",
-                            &P::Read {
-                                key: Some("global".to_string()),
-                            },
+            P::Poll { offsets } => {
+                let msgs = offsets
+                    .iter()
+                    .filter(|(key, _)| logs.contains_key(*key))
+                    .map(|(key, &offset)| {
+                        let log = logs.get(key).unwrap();
+                        let index = binary_search(&log.0, offset);
+                        (
+                            key.clone(),
+                            // Just in case, limit response to 10 entries
+                            Vec::from(&log.0[index..log.0.len().min(index + 10)]),
                         )
-                        .expect("Error sending reread");
-                } else {
-                    panic!("DISASTER {} {}", code, text);
-                }
+                    })
+                    .collect();
+                sender.respond(&message, &P::PollOk { msgs })?;
             }
-            _ => panic!("NOT ALLOWED"),
+            P::CommitOffsets { offsets } => {
+                offsets.iter().for_each(|(key, &offset)| {
+                    commits.insert(key.clone(), offset);
+                });
+                sender.respond(&message, &P::CommitOffsetsOk {})?;
+            }
+            P::ListCommittedOffsets { keys } => {
+                let offsets = keys
+                    .iter()
+                    .filter(|key| commits.contains_key(*key))
+                    .map(|key| (key.clone(), *commits.get(key).unwrap()))
+                    .collect();
+                sender.respond(&message, &P::ListCommittedOffsetsOk { offsets })?;
+            }
+            _ => panic!("NOT ALLOWED: {:?}", message),
         }
     }
 }
